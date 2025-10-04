@@ -1,0 +1,357 @@
+(() => {
+  if (!htmlNode || !data || !data.series) return;
+
+  // Utilitário: pega último valor da primeira série que existir (por nome exato)
+  const getLastValueAny = (seriesNames) => {
+    for (const name of seriesNames) {
+      const series = data.series.find(s => s.name === name);
+      if (!series) continue;
+      const field = series.fields.find(f => f.type === 'number') || series.fields.find(f => f.type === 'string');
+      if (!field || !field.values) continue;
+      return field.values.get(field.values.length - 1);
+    }
+    return null;
+  };
+
+  // Utilitário: pega último valor do primeiro item cujo nome case com algum regex
+  const getLastValueByRegex = (regexList) => {
+    for (const re of regexList) {
+      const series = data.series.find(s => re.test(s.name || ''));
+      if (!series) continue;
+      const field = series.fields.find(f => f.type === 'number') || series.fields.find(f => f.type === 'string');
+      if (!field || !field.values) continue;
+      return field.values.get(field.values.length - 1);
+    }
+    return null;
+  };
+
+  // Uptime (mantido)
+  const uptimeCandidates = ['pfSense: Uptime','System uptime','system.uptime'];
+  const uptimeSec = Number(getLastValueAny(uptimeCandidates));
+  const formatUptime = (s) => {
+    if (!s || isNaN(s)) return 'Carregando...';
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return `${d}d ${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${sec.toString().padStart(2,'0')}`;
+  };
+  const uptime = formatUptime(uptimeSec);
+
+  // CPU e Memória: tenta nomes comuns + regex flexível
+  // CPU: idealmente já em %, mas aceita 0..1 e converte
+  const cpuCandidates = [
+    'pfSense: CPU usage',
+    'CPU usage',
+    'Processor load (1min/core)',
+    'system.cpu.util' // se vier fração
+  ];
+  const cpuRegex = [
+    /cpu.*(usage|utilization)\b/i,
+    /^pfSense:\s*CPU\s+usage\b/i
+  ];
+  let cpuVal = Number(getLastValueAny(cpuCandidates));
+  if (!isFinite(cpuVal)) cpuVal = Number(getLastValueByRegex(cpuRegex));
+  if (isFinite(cpuVal)) {
+    // Heurística: valores <= 1 tratamos como fração (0..1) -> %
+    if (cpuVal > 0 && cpuVal <= 1.0) cpuVal = cpuVal * 100;
+  } else {
+    cpuVal = NaN;
+  }
+
+  // Memória (% usada). Tenta itens prontos; caso só tenhamos usado/total, não calculamos aqui.
+  const memCandidates = [
+    'pfSense: Memory usage',
+    'Memory utilization',
+    'vm.memory.utilization',
+    'Available memory (percent)'
+  ];
+  const memRegex = [
+    /memory.*(usage|utilization|used.*percent|used %)/i,
+    /^pfSense:\s*Memory\s+usage\b/i
+  ];
+  let memVal = Number(getLastValueAny(memCandidates));
+  if (!isFinite(memVal)) memVal = Number(getLastValueByRegex(memRegex));
+  if (isFinite(memVal)) {
+    if (memVal > 0 && memVal <= 1.0) memVal = memVal * 100;
+  } else {
+    memVal = NaN;
+  }
+
+  const clampPct = (v) => isFinite(v) ? Math.max(0, Math.min(100, v)) : NaN;
+  const fmtPct = (v) => isFinite(v) ? `${clampPct(v).toFixed(0)}%` : 'N/D';
+
+  const badgeTone = (v) => {
+    if (!isFinite(v)) return {bg:'#374151', fg:'#E5E7EB'};         // cinza
+    const p = clampPct(v);
+    if (p < 60) return {bg:'#064e3b', fg:'#34d399'};               // verde
+    if (p < 85) return {bg:'#78350f', fg:'#fbbf24'};               // amarelo
+    return {bg:'#7f1d1d', fg:'#f87171'};                           // vermelho
+  };
+
+  // Gateways: regex tolerantes
+  const statusRe  = /^Gateway\s+(.+?)\s+(Status|State)\b/i;
+  const delayRe   = /^Gateway\s+(.+?)\s+(Latency|Delay|RTT)\b/i;
+  const lossRe    = /^Gateway\s+(.+?)\s+(Loss|Packet\s*Loss)\b/i;
+
+  // gatewayKey => { label, statusName, latencyName, lossName }
+  const gateways = new Map();
+
+  for (const s of data.series) {
+    const name = s.name || '';
+    let m = name.match(statusRe);
+    if (m) {
+      const label = m[1].trim();
+      const key = label.toLowerCase();
+      const g = gateways.get(key) || { label };
+      g.statusName = name;
+      gateways.set(key, g);
+      continue;
+    }
+    m = name.match(delayRe);
+    if (m) {
+      const label = m[1].trim();
+      const key = label.toLowerCase();
+      const g = gateways.get(key) || { label };
+      g.latencyName = name;
+      gateways.set(key, g);
+      continue;
+    }
+    m = name.match(lossRe);
+    if (m) {
+      const label = m[1].trim();
+      const key = label.toLowerCase();
+      const g = gateways.get(key) || { label };
+      g.lossName = name;
+      gateways.set(key, g);
+    }
+  }
+
+  // Mapeamento 0=Up, 1=Packet Loss, 2=High Delay (+ textos)
+  const formatStatusFromPing = (val) => {
+    let code = null;
+    if (typeof val === 'number' && isFinite(val)) code = val;
+    else if (typeof val === 'string') {
+      const v = val.trim().toLowerCase();
+      if (v === '0' || v === 'up') code = 0;
+      else if (v === '1' || v.includes('packet') || v.includes('loss')) code = 1;
+      else if (v === '2' || v.includes('high') || v.includes('delay')) code = 2;
+    }
+    if (code === 0) return { text: 'Up', color: '#34d399', borderColor: '#34d399', icon: '✔️' };
+    if (code === 1) return { text: 'Packet Loss', color: '#fbbf24', borderColor: '#fbbf24', icon: '⚠️' };
+    if (code === 2) return { text: 'High Delay', color: '#f87171', borderColor: '#f87171', icon: '⏱️' };
+    return { text: 'Indisponível', color: '#ef4444', borderColor: '#ef4444', icon: '❌' };
+  };
+
+  const getLatencyMs = (val) => {
+    if (typeof val !== 'number' || !isFinite(val) || val <= 0) return null;
+    return val < 10 ? val * 1000 : val; // <10 => segundos; senão ms
+  };
+  const formatLoss = (val) => {
+    if (typeof val !== 'number' || !isFinite(val) || val < 0) return null;
+    return `${val.toFixed(1)}%`;
+  };
+
+  const cardsHtml = Array.from(gateways.values())
+    .sort((a, b) => a.label.localeCompare(b.label, 'pt-BR'))
+    .map(({ label, statusName, latencyName, lossName }) => {
+      const statusVal  = statusName  ? getLastValueAny([statusName])  : null;
+      const latencyRaw = latencyName ? getLastValueAny([latencyName]) : null;
+      const lossRaw    = lossName    ? getLastValueAny([lossName])    : null;
+
+      const status = formatStatusFromPing(statusVal);
+
+      let latencyDisplay = '📶 N/D';
+      let latencyColor = '#a0aec0';
+      let cardBorderColor = status.borderColor;
+      let pulseClass = '';
+
+      const latencyMs = getLatencyMs(Number(latencyRaw));
+      if (typeof latencyMs === 'number') {
+        latencyDisplay = `📶 ${latencyMs.toFixed(1)} ms`;
+        if (latencyMs >= 1.0 && latencyMs < 2.0) {
+          cardBorderColor = '#facc15';
+          latencyColor = '#facc15';
+          pulseClass = 'pulse-yellow';
+        } else if (latencyMs >= 2.0 && latencyMs < 3.0) {
+          cardBorderColor = '#f87171';
+          latencyColor = '#f87171';
+          pulseClass = 'pulse-red';
+        } else {
+          latencyColor = '#9ae6b4';
+        }
+      }
+
+      let lossDisplay = '';
+      const lossPct = Number(lossRaw);
+      const hasLoss = typeof lossPct === 'number' && isFinite(lossPct) && lossPct >= 0;
+      if (hasLoss) {
+        lossDisplay = ` • 📉 ${formatLoss(lossPct)}`;
+        if (lossPct >= 5) {
+          cardBorderColor = '#f87171';
+          latencyColor = '#f87171';
+          pulseClass = 'pulse-red';
+        }
+      }
+
+      return `
+        <div class="inner-status-card ${pulseClass}" style="border-left: 6px solid ${cardBorderColor};">
+          <div class="label">${label}</div>
+          <div class="status" style="color:${status.color};"><span style="margin-right:6px;">${status.icon}</span>${status.text}</div>
+          <div class="latency" style="color: ${latencyColor};">${latencyDisplay}${lossDisplay}</div>
+        </div>
+      `;
+    }).join('');
+
+  const now = new Date();
+  const updatedAt = now.toLocaleString('pt-BR', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+
+  // Badges (tarjas) de CPU e Memória
+  const cpuTone = badgeTone(cpuVal);
+  const memTone = badgeTone(memVal);
+  const cpuText = fmtPct(cpuVal);
+  const memText = fmtPct(memVal);
+
+  htmlNode.innerHTML = `
+    <style>
+      @keyframes pulseYellow {
+        0%, 100% { box-shadow: 0 0 6px #facc15; }
+        50% { box-shadow: 0 0 18px #facc15; }
+      }
+      @keyframes pulseRed {
+        0%, 100% { box-shadow: 0 0 6px #f87171; }
+        50% { box-shadow: 0 0 18px #f87171; }
+      }
+      .pulse-yellow { animation: pulseYellow 2s infinite; }
+      .pulse-red { animation: pulseRed 2s infinite; }
+
+      .card {
+        width: 100%;
+        max-width: 560px;
+        background-color: #121212;
+        border-radius: 8px;
+        padding: 15px 20px;
+        color: #d1d5db;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        user-select: none;
+        box-sizing: border-box;
+      }
+      .card-title {
+        background-color: #172a45;
+        color: #4dc0b5;
+        font-weight: 700;
+        font-size: 16px;
+        padding: 6px 0;
+        border-radius: 4px;
+        text-align: center;
+        margin-bottom: 10px;
+        letter-spacing: 1.2px;
+        user-select: none;
+      }
+
+      .top-badges {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 12px;
+        line-height: 1;
+      }
+      .badge .ico { font-size: 14px; }
+      .badge .label { opacity: .9; }
+      .badge .val { font-variant-numeric: tabular-nums; }
+
+      .info { font-size: 13px; margin-bottom: 6px; user-select: text; }
+      .info strong { color: #9ae6b4; }
+      .uptime { font-size: 13px; margin-bottom: 12px; color: #94a3b8; user-select: text; }
+
+      /* Cards de gateway em 1 linha */
+      .inner-status-card {
+        background-color: #1f2937;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 10px;
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        align-items: center;
+        column-gap: 12px;
+        box-sizing: border-box;
+        transition: box-shadow 0.3s ease;
+      }
+      .inner-status-card:hover { box-shadow: 0 0 12px rgba(255, 255, 255, 0.1); }
+      .inner-status-card .label {
+        font-weight: 600;
+        color: #9ae6b4;
+        font-size: 13px;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .inner-status-card .status {
+        font-weight: 700;
+        text-align: center;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .inner-status-card .latency {
+        font-weight: 600;
+        text-align: right;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+      }
+
+      .img-container { 
+  text-align: center; 
+  margin-bottom: 12px; 
+}
+.img-container img { 
+  max-width: 80px;        /* era 140px */
+  height: auto;
+  opacity: 0.9;           /* opcional: deixa mais sutil */
+}
+    </style>
+
+    <div class="card">
+      <div class="card-title">Firewall</div>
+      <div class="img-container">
+        <img src="https://cdn-icons-png.flaticon.com/512/2059/2059030.png" alt="pfSense" />
+      </div>
+      <div class="top-badges">
+        <div class="badge" style="background:${cpuTone.bg}; color:${cpuTone.fg};">
+          <span class="ico">🖥️</span>
+          <span class="label">CPU</span>
+          <span class="val">${cpuText}</span>
+        </div>
+        <div class="badge" style="background:${memTone.bg}; color:${memTone.fg};">
+          <span class="ico">💾</span>
+          <span class="label">Mem</span>
+          <span class="val">${memText}</span>
+        </div>
+      </div>
+
+      <div class="uptime">Uptime: <strong>${uptime}</strong></div>
+
+      ${cardsHtml || '<div style="font-size:13px;color:#a0aec0;text-align:center;">Nenhum gateway detectado nas séries.</div>'}
+
+      <div class="updated-at" style="font-size: 11px; color: #6b7280; text-align: center; margin-top: 8px; font-style: italic;">
+        Atualizado às ${updatedAt}
+      </div>
+    </div>
+  `;
+})();
