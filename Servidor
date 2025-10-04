@@ -1,0 +1,367 @@
+(() => {
+  if (!htmlNode || !data || !data.series) return;
+
+  // Utilitário: pega último valor da primeira série que existir
+  const getLastValueAny = (seriesNames) => {
+    for (const name of seriesNames) {
+      const series = data.series.find(s => s.name === name);
+      if (!series) continue;
+      const field = series.fields.find(f => f.type === 'number') || series.fields.find(f => f.type === 'string');
+      if (!field || !field.values) continue;
+      return field.values.get(field.values.length - 1);
+    }
+    return null;
+  };
+
+  // Utilitário: pega último valor por regex
+  const getLastValueByRegex = (regexList) => {
+    for (const re of regexList) {
+      const series = data.series.find(s => re.test(s.name || ''));
+      if (!series) continue;
+      const field = series.fields.find(f => f.type === 'number') || series.fields.find(f => f.type === 'string');
+      if (!field || !field.values) continue;
+      return field.values.get(field.values.length - 1);
+    }
+    return null;
+  };
+
+  // Detecta tipo de SO
+  const detectOS = () => {
+    const hostname = getLastValueAny(['Host name of Zabbix agent running', 'system.hostname', 'system.uname']) || '';
+    const uptime = getLastValueAny(['System uptime', 'system.uptime']);
+    
+    if (typeof uptime === 'number' && uptime > 86400) return 'linux';
+    if (hostname.toLowerCase().includes('win') || hostname.toLowerCase().includes('server')) return 'windows';
+    return 'linux';
+  };
+
+  const osType = detectOS();
+  const isWindows = osType === 'windows';
+
+  // Uptime
+  const uptimeCandidates = isWindows 
+    ? ['System uptime', 'Windows: System uptime', 'system.uptime']
+    : ['System uptime', 'system.uptime', 'system.boottime'];
+  
+  const uptimeSec = Number(getLastValueAny(uptimeCandidates));
+  const formatUptime = (s) => {
+    if (!s || isNaN(s)) return 'Carregando...';
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return `${d}d ${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${sec.toString().padStart(2,'0')}`;
+  };
+  const uptime = formatUptime(uptimeSec);
+
+  // CPU
+  const cpuCandidates = isWindows
+    ? ['Processor load (1min/core)', 'CPU utilization', 'Windows: CPU usage']
+    : ['CPU utilization', 'system.cpu.util', 'system.cpu.load'];
+  
+  const cpuRegex = isWindows
+    ? [/cpu.*(usage|utilization|load)/i, /processor.*load/i]
+    : [/cpu.*(usage|utilization|load)/i, /system\.cpu\./i];
+  
+  let cpuVal = Number(getLastValueAny(cpuCandidates));
+  if (!isFinite(cpuVal)) cpuVal = Number(getLastValueByRegex(cpuRegex));
+  if (isFinite(cpuVal)) {
+    if (cpuVal > 0 && cpuVal <= 1.0) cpuVal = cpuVal * 100;
+  } else {
+    cpuVal = NaN;
+  }
+
+  // Memória
+  const memCandidates = isWindows
+    ? ['Memory utilization', 'Windows: Memory usage', 'Available memory (percent)']
+    : ['Memory utilization', 'vm.memory.utilization', 'Available memory (percent)'];
+  
+  const memRegex = isWindows
+    ? [/memory.*(usage|utilization)/i, /windows.*memory/i]
+    : [/memory.*(usage|utilization)/i, /vm\.memory\./i];
+  
+  let memVal = Number(getLastValueAny(memCandidates));
+  if (!isFinite(memVal)) memVal = Number(getLastValueByRegex(memRegex));
+  if (isFinite(memVal)) {
+    if (memVal > 0 && memVal <= 1.0) memVal = memVal * 100;
+  } else {
+    memVal = NaN;
+  }
+
+  // Rede (tráfego) - busca por padrões comuns
+  const netInRegex = [
+    /bits.*received/i,
+    /received.*bits/i,
+    /network.*inbound/i,
+    /net\.if\.in/i
+  ];
+
+  const netOutRegex = [
+    /bits.*sent/i,
+    /sent.*bits/i,
+    /network.*outbound/i,
+    /net\.if\.out/i
+  ];
+
+  const netIn = getLastValueByRegex(netInRegex);
+  const netOut = getLastValueByRegex(netOutRegex);
+  
+  const formatBytes = (bytes) => {
+    if (!bytes || !isFinite(bytes)) return 'N/D';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex++;
+    }
+    return `${size.toFixed(1)} ${units[unitIndex]}/s`;
+  };
+
+  // Disco - nomes exatos do seu Zabbix
+  const diskCandidates = isWindows
+    ? ['FS [OS(C:)]: Space: Used, in%', 'Free disk space on C:', 'Windows: Free disk space on C:']
+    : ['FS [/]: Space: Used, in %', 'Free disk space on /', 'Free disk space on /var'];
+  
+  const diskRegex = isWindows
+    ? [/fs.*os.*c:.*space.*used.*%/i, /windows.*disk/i]
+    : [/fs.*\/.*space.*used.*%/i, /disk.*space/i];
+  
+  let diskVal = Number(getLastValueAny(diskCandidates));
+  if (!isFinite(diskVal)) diskVal = Number(getLastValueByRegex(diskRegex));
+
+  // Se o valor vier como % usado, convertemos para % livre para exibir
+  if (isFinite(diskVal) && diskVal > 0) {
+    diskVal = 100 - diskVal; // Converte "usado" para "livre"
+  }
+  
+  // Backup Status - busca por padrões genéricos
+  const backupRegex = [
+    /backup.*status/i,
+    /status.*backup/i,
+    /backup.*job/i,
+    /job.*backup/i,
+    /backup.*result/i,
+    /result.*backup/i,
+    /last.*backup/i,
+    /backup.*last/i,
+    /job\s*\[.*\]\s*-\s*status/i,  // Job [nome] - status
+    /job\s*\[.*\]\s*status/i,      // Job [nome] status
+    /job\s*\[.*\]\s*-\s*Status/i,  // Job [nome] - Status (maiúsculo)
+    /job\s*\[.*\]\s*Status/i       // Job [nome] Status (maiúsculo)
+  ];
+  
+  const backupStatus = getLastValueByRegex(backupRegex);
+
+  const formatBackupStatus = (status) => {
+    if (status === null || status === undefined) return { text: 'N/D', color: '#6b7280', icon: '❓' };
+    
+    // Converte para string para comparação
+    const s = String(status).toLowerCase();
+    
+    // OK (verde) - 0 = OK
+    if (s === '0' || s.includes('ok') || s.includes('success') || s.includes('completed')) {
+      return { text: 'OK', color: '#34d399', icon: '✅' };
+    }
+    
+    // Warning (amarelo) - 2 = Warning
+    if (s === '2' || s.includes('warning') || s.includes('warn') || s.includes('partial')) {
+      return { text: 'Warning', color: '#fbbf24', icon: '⚠️' };
+    }
+    
+    // Fail (vermelho) - 1 = Fail
+    if (s === '1' || s.includes('fail') || s.includes('error') || s.includes('failed')) {
+      return { text: 'Fail', color: '#ef4444', icon: '❌' };
+    }
+    
+    // Se não reconhecer, mostra como N/D
+    return { text: 'N/D', color: '#6b7280', icon: '❓' };
+  };
+
+  const backup = formatBackupStatus(backupStatus);
+
+  // Utilitários para formatação
+  const clampPct = (v) => isFinite(v) ? Math.max(0, Math.min(100, v)) : NaN;
+  const fmtPct = (v) => isFinite(v) ? `${clampPct(v).toFixed(0)}%` : 'N/D';
+  const fmtDisk = (v) => isFinite(v) ? `${v.toFixed(1)}% livre` : 'N/D';
+
+  // CORES INVERTIDAS PARA DISCO: verde > 20%, amarelo 10-20%, laranja 5-10%, vermelho < 5%
+  const badgeTone = (v) => {
+    if (!isFinite(v)) return {bg:'#374151', fg:'#E5E7EB'};
+    const p = clampPct(v);
+    if (p < 60) return {bg:'#064e3b', fg:'#34d399'};        // verde
+    if (p < 85) return {bg:'#78350f', fg:'#fbbf24'};        // amarelo
+    return {bg:'#7f1d1d', fg:'#f87171'};                   // vermelho
+  };
+
+  // CORES ESPECIAIS PARA DISCO: quanto MENOS livre, mais crítico
+  const diskTone = (v) => {
+    if (!isFinite(v)) return {bg:'#374151', fg:'#E5E7EB'};
+    const p = clampPct(v);
+    if (p > 20) return {bg:'#064e3b', fg:'#34d399'};       // verde: > 20% livre
+    if (p > 10) return {bg:'#78350f', fg:'#fbbf24'};       // amarelo: 10-20% livre
+    if (p > 5) return {bg:'#ea580c', fg:'#fb923c'};        // laranja: 5-10% livre
+    return {bg:'#7f1d1d', fg:'#f87171'};                  // vermelho: < 5% livre
+  };
+
+  const backupTone = (status) => {
+    if (status.text === 'OK') return {bg:'#064e3b', fg:'#34d399'};
+    if (status.text === 'Warning') return {bg:'#78350f', fg:'#fbbf24'};
+    if (status.text === 'Fail') return {bg:'#7f1d1d', fg:'#f87171'};
+    return {bg:'#374151', fg:'#E5E7EB'};
+  };
+
+  const now = new Date();
+  const updatedAt = now.toLocaleString('pt-BR', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+
+  // Badges
+  const cpuTone = badgeTone(cpuVal);
+  const memTone = badgeTone(memVal);
+  const diskToneResult = diskTone(diskVal);  // Usa função especial para disco
+  const backupToneResult = backupTone(backup);
+
+  htmlNode.innerHTML = `
+    <style>
+      .card {
+        width: 100%;
+        max-width: 600px;
+        background-color: #121212;
+        border-radius: 8px;
+        padding: 15px 20px;
+        color: #d1d5db;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        user-select: none;
+        box-sizing: border-box;
+      }
+      .card-title {
+        background-color: #172a45;
+        color: #4dc0b5;
+        font-weight: 700;
+        font-size: 16px;
+        padding: 6px 0;
+        border-radius: 4px;
+        text-align: center;
+        margin-bottom: 10px;
+        letter-spacing: 1.2px;
+        user-select: none;
+      }
+      .img-container { 
+        text-align: center; 
+        margin-bottom: 12px; 
+      }
+      .img-container img { 
+        max-width: 80px;
+        height: auto;
+        opacity: 0.9;
+      }
+      .top-badges {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 12px;
+        line-height: 1;
+      }
+      .badge .ico { font-size: 14px; }
+      .badge .label { opacity: .9; }
+      .badge .val { font-variant-numeric: tabular-nums; }
+      .info { font-size: 13px; margin-bottom: 6px; user-select: text; }
+      .info strong { color: #9ae6b4; }
+      .uptime { font-size: 13px; margin-bottom: 12px; color: #94a3b8; user-select: text; }
+      .network-info {
+        background-color: #1f2937;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: #9ae6b4;
+      }
+      .network-info .label {
+        font-weight: 600;
+        margin-bottom: 4px;
+        color: #4dc0b5;
+      }
+      .network-stats {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .network-stat {
+        text-align: center;
+        flex: 1;
+      }
+      .network-stat .value {
+        font-weight: 700;
+        color: #34d399;
+        font-size: 12px;
+      }
+      .network-stat .label {
+        font-size: 11px;
+        color: #6b7280;
+        margin-top: 2px;
+      }
+    </style>
+
+    <div class="card">
+      <div class="card-title">${isWindows ? 'Windows Server' : 'Linux Server'}</div>
+      <div class="img-container">
+        <img src="${isWindows ? 'https://cdn-icons-png.flaticon.com/512/888/888853.png' : 'https://cdn-icons-png.flaticon.com/512/226/226772.png'}" alt="${isWindows ? 'Windows' : 'Linux'}" />
+      </div>
+
+      <div class="top-badges">
+        <div class="badge" style="background:${cpuTone.bg}; color:${cpuTone.fg};">
+          <span class="ico">💻</span>
+          <span class="label">CPU</span>
+          <span class="val">${fmtPct(cpuVal)}</span>
+        </div>
+        <div class="badge" style="background:${memTone.bg}; color:${memTone.fg};">
+          <span class="ico">🔲</span> 
+          <span class="label">Mem</span>
+          <span class="val">${fmtPct(memVal)}</span>
+        </div>
+        <div class="badge" style="background:${diskToneResult.bg}; color:${diskToneResult.fg};">
+          <span class="ico">💽</span>
+          <span class="label">Disco</span>
+          <span class="val">${fmtDisk(diskVal)}</span>
+        </div>
+        <div class="badge" style="background:${backupToneResult.bg}; color:${backupToneResult.fg};">
+          <span class="ico">${backup.icon}</span>
+          <span class="label">Backup</span>
+          <span class="val">${backup.text}</span>
+        </div>
+      </div>
+
+      <div class="network-info">
+        <div class="label">📡 Rede</div>
+        <div class="network-stats">
+          <div class="network-stat">
+            <div class="value">${formatBytes(netIn)}</div>
+            <div class="label">Entrada</div>
+          </div>
+          <div class="network-stat">
+            <div class="value">${formatBytes(netOut)}</div>
+            <div class="label">Saída</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="uptime">Uptime: <strong>${uptime}</strong></div>
+
+      <div class="updated-at" style="font-size: 11px; color: #6b7280; text-align: center; margin-top: 8px; font-style: italic;">
+        Atualizado às ${updatedAt}
+      </div>
+    </div>
+  `;
+})();
